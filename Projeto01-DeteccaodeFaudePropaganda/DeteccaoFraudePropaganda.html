@@ -627,7 +627,7 @@ modeloRL &lt;- glm(formula = is_attributed ~ ., data = trainSet, family = &quot;
 ##                                           
 ##        &#39;Positive&#39; Class : 0               
 ## </code></pre>
-<pre class="r"><code>#A regressao logistica teve o mesmo problema da random florest, muitos falsos positivos
+<pre class="r"><code>#A regressao logistica teve o mesmo problema do Random Florest, muitos falsos positivos
 #Vou testar agora o modelo de Random Florest com o dataset de teste
 levels(testSet$device) &lt;- levels(trainSet$device)
 previsoes &lt;- data.frame(observado = testSet$is_attributed,
