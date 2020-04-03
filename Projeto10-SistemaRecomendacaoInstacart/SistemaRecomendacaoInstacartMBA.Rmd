@@ -1,0 +1,630 @@
+---
+title: "SistemaRecomendacaoInstacartMBA"
+author: "Eduardo de Souza Dias"
+date: "3/28/2020"
+output: html_document
+---
+
+<style type="text/css">
+.main-container {
+  max-width: 1800px;
+  margin-left: auto;
+  margin-right: auto;
+}
+</style>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.width=20, fig.height=8, fig.align = "center")
+options(width = 1024)
+```
+
+```{r fig.width=20, fig.height=12}
+
+# Project 10 - BusinessAnalytics - DSA (part of Formação cientista de dados)
+# Forecasting products that users will buy on their next order
+
+# At this project, we will analyse datasets provided by Instacart in their Kaggle competition.
+# The idea is to understand users' behavior, how products are related and than forcast what
+# product will be in the next user' order. For that, we have a dataset with the last
+# users' orders, a dataset with the last order and information about products. Price and
+# quantity are not avaliable.
+
+# Define folder
+setwd("C:/Cursos/FCD/05-BusinessAnalytics/Cap10-ProjetosFeedback/Projeto10")
+getwd()
+
+library(data.table)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(scales)
+library(knitr)
+library(arules)
+library(arulesViz)
+library(caret)
+library(randomForest)
+library(pROC)
+library(DMwR)
+library(stringr)
+
+# Datasets ---------------------------------------------------------------------------
+dfAisles <- fread("aisles.csv")
+dfDepartments <- fread("departments.csv")
+dfOrderProductsPrior <- fread("order_products__prior.csv")
+dfOrderProductsTrain <- fread("order_products__train.csv")
+dfOrders <- fread("orders.csv")
+dfProducts <- fread("products.csv")
+
+# Jutando os datasets
+df <- left_join(dfOrderProductsPrior,dfProducts,by="product_id")
+df <- left_join(df,dfAisles,by="aisle_id")
+df <- left_join(df,dfDepartments,by="department_id")
+df <- left_join(df,dfOrders,by="order_id")
+df <- df[, c(1,2,10,5,8,9,3,4,12,13,14,15)]
+
+dfOrderProductsTrain <- left_join(dfOrderProductsTrain,dfOrders, by='order_id')
+
+dfProducts <- dfProducts %>% left_join(dfAisles) %>% left_join(dfDepartments) %>% 
+  select(-aisle_id, -department_id)
+
+rm(dfAisles, dfDepartments, dfOrderProductsPrior, dfOrders)
+
+# Exploratory analisys --------------------------------------------------------------
+
+# All Products and departments
+dfProducts <- dfProducts %>% arrange(department, aisle)
+dfProducts$aisle <- factor(dfProducts$aisle, levels=unique(dfProducts$aisle))
+
+print(paste('Number of departments:', length(unique(dfProducts$department))))
+dfProducts %>%
+  group_by(department,aisle) %>%
+  summarize(contar = n()) %>%
+  mutate(perc = contar / length(dfProducts$product_id)) %>%
+  select(-contar) %>%
+  ggplot() + geom_bar(aes(department, perc, fill=aisle), stat="identity", colour="black") + 
+  labs(title="Number of products vs department", x="Department", y="% of products") + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1), legend.position = 'bottom') + 
+  scale_y_continuous(labels = percent) + guides(fill=guide_legend(ncol=10)) + 
+  annotate("text", x = 3, y = 0.11, label = paste(format(length(unique(dfProducts$product_id)), big.mark='.')," products"), fontface = 2, size = 12)
+
+# Department orders
+df %>%
+  group_by(department) %>%
+  summarize(contar = n()) %>%
+  mutate(perc = contar / sum(contar)) %>%
+  mutate(highlight = ifelse(department == 'produce' | department == 'dairy eggs' | department == 'snacks', F,T)) %>%
+  ggplot + geom_bar(aes(x=reorder(department,-perc), y=perc, fill=highlight), stat="identity") + 
+  labs(title="Department orders", x="Department", y="% of orders") + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none") + 
+  scale_y_continuous(labels = percent) + 
+  annotate("text", x = 6.5, y = 0.2, label = "3 departments represents more than 50% of all orders", fontface = 2, size = 8, color="#0f4c81") + 
+  scale_fill_manual(values=c("#0f4c81", "#999999"))
+
+# TOP 20 aisle
+df %>%
+  group_by(aisle) %>%
+  summarize(contar = n()) %>%
+  mutate(perc = contar / sum(contar)) %>%
+  top_n(20) %>%
+  ggplot + geom_bar(aes(x=reorder(aisle,-perc), y=perc), stat="identity") + 
+    labs(title="TOP 20 - Aisle", x="Aisle", y="% of orders") + 
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+    scale_y_continuous(labels = percent) + 
+    annotate("text", x = 10, y = 0.07, label = "Top 20 aisle represents 60% of all orders", fontface = 2, size = 8,)
+  
+# Top 20 products
+df %>%
+  group_by(product_name) %>%
+  summarize(contar = n()) %>%
+  mutate(perc = contar / sum(contar)) %>%
+  top_n(20) %>%
+  ggplot + geom_bar(aes(x=reorder(product_name,-perc), y=perc), stat="identity") + 
+  labs(title="TOP 20 - Products", x="Product", y="% of orders") + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  scale_y_continuous(labels = percent)
+
+# Clients' number of orders
+df %>%
+  select(order_id, user_id) %>%
+  group_by(user_id) %>%
+  distinct() %>%
+  summarize(numOrdens = n()) %>%
+  group_by(numOrdens) %>%
+  summarise(contar = n()) %>%
+  mutate(perc = contar / sum(contar)) %>%
+  ggplot + geom_bar(aes(x=numOrdens, y=perc), stat="identity") + 
+  labs(title="Clients' number of orders", x="# of orders", y="% of clients") + 
+  scale_y_continuous(labels = percent) + scale_x_continuous(breaks = seq(0, 100, by = 2))
+
+# The minimum number of orders a client did was 3 on dataset. Some few clients ordered 100 times. 
+
+# Day of week vs hour orders
+df %>%
+  select(order_id, order_dow, order_hour_of_day) %>%
+  distinct() %>%
+  group_by(order_dow, order_hour_of_day) %>%
+  summarise(contar = n()) %>%
+  ggplot() + geom_tile(aes(order_dow, order_hour_of_day, fill=contar)) + 
+  scale_x_continuous(breaks = seq(0, 6, by = 1)) + scale_y_continuous(breaks = seq(0, 23, by = 1)) +
+  labs(title="Day of week vs hour orders", x="Day of week", y="Hour")
+
+# We can see that most clients order between 13h and 15h, on saturday and between 9h and 10h
+# on saunday.
+
+# Products by add order
+df %>%
+  group_by(add_to_cart_order, product_name) %>%
+  summarize(contar = n()) %>%
+  mutate(perc = contar / sum(contar)) %>%
+  arrange(add_to_cart_order,desc(contar)) %>%
+  filter(add_to_cart_order <= 5) %>%
+  top_n(5) %>%
+  ggplot + geom_bar(aes(x=reorder(product_name,-perc), y=perc, fill=product_name), stat="identity") + 
+    facet_grid(rows=vars(add_to_cart_order)) + 
+    labs(title="TOP 5 - Products by add order", x="Products", y="% of orders") + 
+    theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none") + 
+    scale_y_continuous(labels = percent) + 
+    scale_fill_manual(values=c("#ffef99", "#ffeb7f", "#8dc63f", "#065535", "#ff5f5f", "white"))
+
+# Order distribution by number of products
+df %>%
+  group_by(order_id) %>%
+  summarize(PorcReordered = sum(reordered) / n(), numProdutosNaOrdem = n()) %>%
+  group_by(numProdutosNaOrdem) %>%
+  summarise(qtOrdens = n(), PorcReorderedFull = mean(PorcReordered)) %>%
+  mutate(perc = qtOrdens / sum(qtOrdens)) %>%
+  mutate(PorcReordered = PorcReorderedFull * perc) %>%
+  filter(numProdutosNaOrdem <= 50) %>%
+  ggplot + geom_bar(aes(x=numProdutosNaOrdem, y=perc), stat="identity") + 
+  geom_bar(aes(x=numProdutosNaOrdem, y=PorcReordered), stat="identity", fill = "#0f4c81") +
+  labs(title="Order distribution by number of products (% reordered in blue)", x="# products", y="% of orders") + 
+  scale_y_continuous(labels = percent) + scale_x_continuous(breaks = seq(1, 50, by = 1)) + 
+  annotate("rect", xmin = 0.5, xmax = 8.5, ymin = -0.005, ymax = .075, alpha= .2) + 
+  annotate("text", x = 13, y = 0.07, label = "50% of orders", fontface = 2, size = 8, color="#696969") +
+  annotate("text", x = 24, y = 0.02, label = "Mean: 60% reordered", fontface = 2, size = 7, color="#0f4c81") +
+  geom_text(aes(label = paste(format(PorcReorderedFull*100, digits=0),"%"), x=numProdutosNaOrdem, y=0), vjust=-0.8, color="white", size=3)
+
+# Orders vs prior order in days
+df %>%
+  group_by(order_id, days_since_prior_order) %>%
+  summarise(PorcReordered = sum(reordered) / n()) %>%
+  group_by(days_since_prior_order) %>%
+  summarise(qtOrdens = n(), PorcReorderedFull = mean(PorcReordered)) %>%
+  mutate(perc = qtOrdens / sum(qtOrdens)) %>%
+  mutate(PorcReordered = PorcReorderedFull * perc) %>%
+  ggplot + geom_bar(aes(x=days_since_prior_order, y=perc), stat="identity") + 
+  geom_bar(aes(x=days_since_prior_order, y=PorcReordered), stat="identity", fill = "#0f4c81") +
+  geom_text(aes(label = paste(format(PorcReorderedFull*100, digits=0),"%"), x=days_since_prior_order, y=0), vjust=-0.8, color="white") +
+  labs(title="% of orders vs days from prior order", x="Days from prior order", y="% of orders") + 
+  scale_y_continuous(labels = percent) + scale_x_continuous(breaks = seq(0, 30, by = 1))
+
+# We have to peaks. The first weekkly (7 days) and the other monthly (30 days). 
+
+# Products bougth with many other
+df %>%
+  group_by(order_id) %>%
+  summarize(numProdutosNaOrdem = n()) %>%
+  left_join(df,by='order_id') %>%
+  group_by(product_name) %>%
+  summarise(numProdutosNaOrdemMedio = mean(numProdutosNaOrdem), numProductsSold = n()) %>%
+  filter(numProductsSold > 2) %>%
+  top_n(10, numProdutosNaOrdemMedio) %>%
+  ggplot + geom_bar(aes(x=reorder(product_name,-numProdutosNaOrdemMedio), y=numProdutosNaOrdemMedio), stat="identity") + 
+    labs(title="Products bougth with many other", x="Products", y="# products in order") + 
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) + scale_y_continuous(labels = comma)
+
+# Products bougth almost exclusive
+df %>%
+  group_by(order_id) %>%
+  summarize(numProdutosNaOrdem = n()) %>%
+  left_join(df,by='order_id') %>%
+  group_by(product_name) %>%
+  summarise(numProdutosNaOrdemMedio = mean(numProdutosNaOrdem), numProductsSold = n()) %>%
+  filter(numProductsSold > 2) %>%
+  top_n(-10, numProdutosNaOrdemMedio) %>%
+  ggplot + geom_bar(aes(x=reorder(product_name,numProdutosNaOrdemMedio), y=numProdutosNaOrdemMedio), stat="identity") + 
+  labs(title="Products bougth almost exclusive", x="Products", y="# products in order") + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + scale_y_continuous(labels = comma)
+
+# Products most reordered
+df %>%
+  group_by(product_name) %>%
+  summarise(numReordered = sum(reordered), numProductsSold = n()) %>%
+  filter(numProductsSold > 2) %>%
+  mutate(PorcReordered = numReordered / numProductsSold) %>%
+  top_n(10, PorcReordered) %>%
+  ggplot + geom_bar(aes(x=reorder(product_name,PorcReordered), y=PorcReordered), stat="identity") + 
+  labs(title="Products most reordered", x="Products", y="% Reordered") + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + scale_y_continuous(labels = percent)
+
+# Reordered - quantile and men  
+dfTemp <- df %>%
+  group_by(product_name) %>%
+  summarise(numReordered = sum(reordered), numProductsSold = n()) %>%
+  filter(numProductsSold > 2) %>%
+  mutate(PorcReordered = numReordered / numProductsSold)
+
+quantile(dfTemp$PorcReordered)
+print(paste("Mean: ",mean(dfTemp$PorcReordered)))
+rm(dfTemp)
+
+# Market Basket Analysis
+
+# Generate a csv dataset
+#dfSparse <- df %>%
+#  group_by(order_id) %>%
+#  select(order_id, product_name) %>%
+#  mutate(product_name2 = paste0(product_name, collapse = ",")) %>%
+#  select(order_id,product_name2) %>%
+#  distinct()
+#dfSparse$order_id <- NULL
+#write.csv(dfSparse,"market_basket_transactions.csv", quote = FALSE, row.names = FALSE)
+#rm(dfSparse)
+
+# Import as transaction
+tr <- read.transactions('market_basket_transactions.csv', format = 'basket', sep=',')
+summary(tr)
+
+# Calculate association rules based on min support and confidence
+regrasAssociacao <- apriori(tr, parameter = list(supp=0.001, conf=0.8,maxlen=10))
+
+# 231 rules created. Let's take a look on the top 10.
+inspect(regrasAssociacao[1:10])
+
+# Remove redundant rules
+regrasSubset <- which(colSums(is.subset(regrasAssociacao, regrasAssociacao)) > 1) # get subset rules in vector
+length(regrasSubset)
+regrasAssociacaoSubSet <- regrasAssociacao[-regrasSubset]
+
+# We removed 178 rules, remaning 53. Avarage support of 0.0011 and confidence from 0.8 to 1
+inspect(regrasAssociacaoSubSet)
+
+# Transforme in dataframe to posterior use
+dfAssociationRules = DATAFRAME(regrasAssociacaoSubSet)
+dfAssociationRules$LHS <- str_sub(dfAssociationRules$LHS,2,str_length(dfAssociationRules$LHS)-1)
+dfAssociationRules$RHS <- str_sub(dfAssociationRules$RHS,2,str_length(dfAssociationRules$RHS)-1)
+dfAssociationRules <- dfAssociationRules %>% mutate(Rule1=0, Rule2=0)
+dfAssociationRules <- dfAssociationRules %>% group_by(LHS) %>% summarise(n=n()) %>% left_join(dfAssociationRules)
+
+item = 1
+while (item <= length(dfAssociationRules$LHS)){
+  dfAssociationRules[item,'Rule1']=dfAssociationRules[item,'RHS']
+  if (dfAssociationRules[item,2] == 2){
+    dfAssociationRules[item,'Rule2']=dfAssociationRules[item+1,'RHS']
+    dfAssociationRules[item + 1,'Rule1']=dfAssociationRules[item,'RHS']
+    dfAssociationRules[item + 1,'Rule2']=dfAssociationRules[item+1,'RHS']
+    item = item + 1
+  }
+  item = item + 1
+}
+
+dfTemp <- dfAssociationRules %>% select(RHS, Rule1, Rule2) %>% distinct()
+dfTemp <- dfTemp %>% group_by(RHS) %>% summarise(n=n()) %>% left_join(dfTemp)
+dfTemp <- dfTemp[!(dfTemp$n==2 & dfTemp$Rule2==0),]
+names(dfTemp)[1] <- "product_name"
+dfTemp$n <- NULL
+
+dfAssociationRulesFinal <- dfAssociationRules %>% select(LHS, Rule1, Rule2) %>% distinct()
+names(dfAssociationRulesFinal)[1] <- "product_name"
+dfAssociationRulesFinal <- bind_rows(dfAssociationRulesFinal,dfTemp)
+
+# Data Viz
+subRegras<-regrasAssociacao[quality(regrasAssociacao)$confidence>0.4]
+# Plot SubRules
+# The majority rules are located up left and  support is smaller than 0.005 bps.
+plot(subRegras, engine = "htmlwidget")
+# The color represents the number of itens in the rule
+plot(subRegras,method="two-key plot", engine = "htmlwidget")
+
+# This graph shows the rules as a chain. It is possible to see the entire rule.
+top10subRules <- head(subRegras, n = 10, by = "confidence")
+plot(top10subRules, method = "graph",  engine = "htmlwidget")
+
+# This graph shows as buying a product follows to another.
+# 2 - The most recent addition
+# 1 - The item I had
+subRegras2<-head(subRegras, n=20, by="lift")
+plot(subRegras2, method="paracoord")
+
+# Some rules such as Hue Rolls -> Paper Towels have great support and lift
+plot(top10subRules, method = "grouped")
+
+rm(tr, regrasAssociacao, regrasAssociacaoSubSet, subRegras, subRegras2, top10subRules, regrasSubset)
+
+# Model-----------------------------------------------------------------------------------------
+
+# Creating indicators for products
+# % Reordered
+dfTemp <- df %>% group_by(product_id) %>% summarise(numReorderedMeanPrd = sum(reordered)/n())
+dfProducts <- left_join(dfProducts, dfTemp)
+# Number products in orders the product is included mean/std
+dfTemp <- df %>%
+  group_by(order_id) %>%
+  summarize(numPrdOrdem = n()) %>%
+  left_join(df) %>%
+  group_by(product_name) %>%
+  summarise(numPrdOrderMeanPrd = mean(numPrdOrdem),
+            numPrdOrderStdPrd = sd(numPrdOrdem))
+dfProducts <- left_join(dfProducts, dfTemp)
+# Day of week, hour, add to cart, order number mean/std
+dfTemp <- df %>%
+  group_by(product_id) %>%
+  summarize(
+    dayOfWeekMeanPrd = mean(order_dow),
+    dayOfWeekStdPrd = sd(order_dow),
+    hourDayMeanPrd = mean(order_hour_of_day),
+    hourDayStdPrd = sd(order_hour_of_day),
+    addCartMeanPrd = mean(add_to_cart_order),
+    addCartStdPrd = sd(add_to_cart_order),
+    orderNumberMeanPrd = mean(order_number),
+    orderNumberStdPrd = sd(order_number))
+dfProducts <- left_join(dfProducts, dfTemp)
+# Days since prior order
+dfTemp <- df %>% filter(is.na(days_since_prior_order) == FALSE) %>%
+  group_by(product_id) %>%
+  summarize(
+    daysPriorOrderMeanPrd = mean(days_since_prior_order),
+    daysPriorOrderStdPrd = sd(days_since_prior_order))
+dfProducts <- left_join(dfProducts, dfTemp)
+# How many times de product was sold
+dfTemp <- df %>% group_by(product_id) %>% summarise(NumSoldPrd = n())
+dfProducts <- left_join(dfProducts, dfTemp)
+# How many users bought the product
+dfTemp <- df %>% group_by(product_id, user_id) %>% summarise(n = n()) %>% 
+                 group_by(product_id) %>% summarise(NumUserBougthPrd=n())
+dfProducts <- left_join(dfProducts, dfTemp)
+
+# Creating indicators for users
+# % Reordered mean/std
+dfUsers <- df %>% group_by(user_id, order_id) %>% summarise(n = sum(reordered)/n()) %>%
+  group_by(user_id) %>% summarise(numReorderedMeanUser = mean(n), numReorderedMStdUser = sd(n))
+# Dow of last order
+dfUsers <- dfOrderProductsTrain %>% select(user_id, order_dow) %>% distinct() %>% right_join(dfUsers)
+names(dfUsers)[2] <- "DowLastOrderUser"
+# Hour of last order
+dfUsers <- dfOrderProductsTrain %>% select(user_id, order_hour_of_day) %>% distinct() %>% right_join(dfUsers)
+names(dfUsers)[2] <- "HourLastOrderUser"
+# Days since prior order of last order
+dfUsers <- dfOrderProductsTrain %>% select(user_id, days_since_prior_order) %>% distinct() %>% right_join(dfUsers)
+names(dfUsers)[2] <- "DaysSincePriorLastOrderUser"
+# Number products in orders the user does
+dfTemp <- df %>%
+  group_by(order_id) %>%
+  summarize(numPrdOrdem = n()) %>%
+  left_join(df) %>%
+  group_by(user_id) %>%
+  summarise(numPrdMeanUser = mean(numPrdOrdem), numPrdStdUser = sd(numPrdOrdem))
+dfUsers <- left_join(dfUsers, dfTemp)
+# Day of week, hour, add to cart, order number avegare/std
+dfTemp <- df %>%
+  group_by(user_id) %>%
+  summarize(
+    dayOfWeekMeanUser = mean(order_dow),
+    dayOfWeekStdUser = sd(order_dow),
+    hourDayMeanUser = mean(order_hour_of_day),
+    hourDayStdUser = sd(order_hour_of_day),
+    addCartMeanUser = mean(add_to_cart_order),
+    addCartStdUser = sd(add_to_cart_order),
+    orderNumberMeanUser = mean(order_number),
+    orderNumberStdUser = sd(order_number))
+dfUsers <- left_join(dfUsers, dfTemp)
+# Days since prior order average/std
+dfTemp <- df %>% filter(is.na(days_since_prior_order) == FALSE) %>%
+  group_by(user_id) %>%
+  summarize(
+    daysPriorOrderMeanUser = mean(days_since_prior_order),
+    daysPriorOrderStdUser = sd(days_since_prior_order))
+dfUsers <- left_join(dfUsers, dfTemp)
+# How many times the client has ordered
+dfTemp <- df %>% group_by(order_id,user_id) %>% summarise(NumPrd = n()) %>% group_by(user_id) %>% summarise(NumOrderedUser=n())
+dfUsers <- left_join(dfUsers, dfTemp)
+# How many products the user bought
+dfTemp <- df %>% group_by(user_id) %>% summarise(NumPrdUser = n())
+dfUsers <- left_join(dfUsers, dfTemp)
+
+# Gerando o dataset final
+dfFinal <- df %>% select(user_id, product_id) %>% distinct()
+dfFinal <- left_join(dfFinal,dfProducts, by='product_id')
+dfFinal <- left_join(dfFinal,dfUsers, by='user_id')
+
+# User-product indicators
+# Number that user bougth the product
+dfTemp <- df %>% group_by(user_id, product_id) %>% summarise(PU_NumUserBoutghPrd = n())
+dfFinal <- left_join(dfFinal, dfTemp, by=c('user_id','product_id'))
+# Number or orders user did after bougth the product by the last time
+dfTemp <- df %>% group_by(user_id, product_id) %>% summarise(order_number = max(order_number))
+dfTemp <- df %>% group_by(user_id) %>% summarise(order_numberMAX = max(order_number)) %>%
+  left_join(dfTemp, by='user_id') %>% mutate(PU_OrdersSinceLastBougth = order_numberMAX-order_number)
+dfTemp$order_number <- NULL
+dfTemp$order_numberMAX <- NULL
+dfFinal <- left_join(dfFinal, dfTemp, by=c('user_id','product_id'))
+# Number or days passed after bougth the product by the last time: days and normalized by user mean
+dfTemp2 <- df
+dfTemp2$days_since_prior_order <- replace_na(dfTemp2$days_since_prior_order,0)
+dfTemp <- dfTemp2 %>% group_by(user_id, product_id) %>% summarise(daysProduct = sum(days_since_prior_order))
+dfTemp <- dfTemp2 %>% group_by(user_id, order_id) %>% summarise(n = sum(days_since_prior_order)/n()) %>%
+  group_by(user_id) %>% summarise(daysProductMAX = sum(n)) %>%
+  left_join(dfTemp, by='user_id') %>% mutate(PU_DaysSinceLastBougth = daysProductMAX-daysProduct)
+rm(dfTemp2)
+dfTemp$daysProductMAX <- NULL
+dfTemp$daysProduct <- NULL
+
+dfTemp <- left_join(dfTemp,dfUsers[,c('user_id','daysPriorOrderMeanUser')], by='user_id')
+dfTemp <- dfTemp %>% mutate(PU_DaysSinceLastBougthNorm = PU_DaysSinceLastBougth/daysPriorOrderMeanUser)
+dfTemp$daysPriorOrderMeanUser <- NULL
+dfFinal <- left_join(dfFinal, dfTemp, by=c('user_id','product_id'))
+# Boolean if product was ever reorderd by user
+dfTemp <- df %>% group_by(user_id, product_id) %>% summarise(PU_PrdEverReorderedUser = max(reordered))
+dfFinal <- left_join(dfFinal, dfTemp, by=c('user_id','product_id'))
+
+# Add Market Basket Analysis for products
+dfFinal <- left_join(dfFinal, dfAssociationRulesFinal, by='product_name')
+dfFinal$Rule1 <- replace_na(dfFinal$Rule1,0)
+dfFinal$Rule2 <- replace_na(dfFinal$Rule2,0)
+rm(dfTemp)
+
+# Verify if the product was bougth in last order by user (boolean)
+dfUsersPrdTrain <- dfOrderProductsTrain %>% select(user_id, product_id) %>% distinct() %>% 
+  mutate(boughtLastOrder=1)
+dfFinal <- left_join(dfFinal, dfUsersPrdTrain, by=c('user_id', 'product_id'))
+
+# Remove NAs
+dfFinal <- dfFinal %>% replace(is.na(.), 0)
+# Remove unnecessary columns
+dfFinal$product_name <- NULL
+dfFinal$aisle <- NULL
+dfFinal$department <- NULL
+
+# Normalize dataset
+for (item in names(dfFinal[,-c(1,2,42,43,44)])){
+  X <- dfFinal[[item]]
+  dfFinal[[item]] <- (X - min(X)) / (max(X) - min(X))
+}
+
+# Transform to factor
+dfFinal$boughtLastOrder <- as.factor(dfFinal$boughtLastOrder)
+dfFinal$Rule1 <- as.factor(dfFinal$Rule1)
+dfFinal$Rule2 <- as.factor(dfFinal$Rule2)
+
+# Generate train/test users
+dfUsersTrain <- dfOrderProductsTrain %>% select(user_id) %>% distinct()
+trainIndex <- createDataPartition(dfUsersTrain$user_id, p = .7, list = FALSE, times = 1)
+trainSet <- dfUsersTrain[trainIndex]
+testSet  <- dfUsersTrain[-trainIndex]
+
+trainSet <- dfFinal %>% filter(user_id %in% trainSet)
+testSet <- dfFinal %>% filter(user_id %in% testSet)
+
+# Remove unnecessary columns
+trainSet$user_id <- NULL
+trainSet$product_id <- NULL
+testSet$user_id <- NULL
+testSet$product_id <- NULL
+
+rm(df, dfFinal, dfOrderProductsTrain, dfUsers, dfProducts, trainIndex, dfUsersPrdTrain, dfUsersTrain, item, X, dfAssociationRules, dfAssociationRulesFinal)
+
+# Train models
+#write.csv(trainSet,"trainSet.csv", quote = FALSE, row.names = FALSE)
+#write.csv(testSet,"testSet.csv", quote = FALSE, row.names = FALSE)
+trainSet <- fread("trainSet.csv")
+testSet <- fread("testSet.csv")
+trainSet$boughtLastOrder <- as.factor(trainSet$boughtLastOrder)
+testSet$boughtLastOrder <- as.factor(testSet$boughtLastOrder)
+trainSet$Rule1 <- as.factor(trainSet$Rule1)
+trainSet$Rule2 <- as.factor(trainSet$Rule2)
+testSet$Rule1 <- as.factor(testSet$Rule1)
+testSet$Rule2 <- as.factor(testSet$Rule2)
+
+# As it is an educational project and for computacional reasons, we will reduce the train dataset, so we can 
+# run models faster. We will take the opportunity to balance the train dataset to 50/50.
+dfTemp <- trainSet %>% filter(boughtLastOrder==1) %>% sample_n(15000)
+trainSet <- trainSet %>% filter(boughtLastOrder==0) %>% sample_n(15000) %>% bind_rows(dfTemp)
+trainSet <- sample_n(trainSet, 30000, replace=FALSE)
+
+dfTemp <- testSet %>% filter(boughtLastOrder==1) %>% sample_n(5000)
+testSetB <- testSet %>% filter(boughtLastOrder==0) %>% sample_n(5000) %>% bind_rows(dfTemp)
+testSetB <- sample_n(testSetB, 10000, replace=FALSE)
+
+testSet <- sample_n(testSet, 10000, replace=FALSE)
+
+rm(dfTemp)
+
+# Define cross validation
+ctrl <- trainControl(method = "cv", number=5)
+variaveisModelo <- as.formula(boughtLastOrder ~ .)
+
+library(doParallel)
+cl <- makePSOCKcluster(5)
+registerDoParallel(cl)
+
+# Random Forest
+modeloRF <- train(variaveisModelo, data=trainSet, method='rf', trControl=ctrl)
+
+# Checking the most important parameters
+plot(varImp(modeloRF))
+
+# We can see that parameters regarind products and users are de most importants, while variables from
+# market basket analysis are weak to predict
+
+print(modeloRF)
+previsoes <- data.frame(observado = testSet$boughtLastOrder,
+                        previsto = predict(modeloRF, newdata = testSet))
+confusionMatrix(previsoes$observado, previsoes$previsto,mode = "prec_recall")
+
+# We got a good accurancy, but only because the test dataset is really umbalanced. The model made wrong 
+# prediciton for calss 1 (user ordered), making more mistakes than corrected forecasts. Let's use balanced
+# test dataset and check accucary.
+
+previsoes <- data.frame(observado = testSetB$boughtLastOrder,
+                        previsto = predict(modeloRF, newdata = testSetB))
+confusionMatrix(previsoes$observado, previsoes$previsto,mode = "prec_recall")
+
+# Now, the overall accuracy have moved down, but the model was able to get more corrected predictions for
+# Class 1. Let's try another model.
+
+# Stochastic Gradient Boosting
+modeloSGB <- train(variaveisModelo, data=trainSet, method='gbm', trControl=ctrl, verbose=FALSE)
+print(modeloSGB)
+previsoes <- data.frame(observado = testSet$boughtLastOrder,
+                        previsto = predict(modeloSGB, newdata = testSet))
+confusionMatrix(previsoes$observado, previsoes$previsto,mode = "prec_recall")
+
+# The result has improved, but it keeps the same problems, caused but predominance of classes 0.
+# With balanced test dataset.
+
+previsoes <- data.frame(observado = testSetB$boughtLastOrder,
+                        previsto = predict(modeloSGB, newdata = testSetB))
+confusionMatrix(previsoes$observado, previsoes$previsto,mode = "prec_recall")
+
+# The result improve a lot. Let's try anothe model.
+
+# Extreme Gradient Boosting
+modeloEGB <- train(variaveisModelo, data=trainSet, method='xgbLinear', trControl=ctrl)
+print(modeloEGB)
+previsoes <- data.frame(observado = testSet$boughtLastOrder,
+                        previsto = predict(modeloEGB, newdata = testSet))
+confusionMatrix(previsoes$observado, previsoes$previsto,mode = "prec_recall")
+
+# The result got worse.
+# With balanced test sataset.
+
+previsoes <- data.frame(observado = testSetB$boughtLastOrder,
+                        previsto = predict(modeloEGB, newdata = testSetB))
+confusionMatrix(previsoes$observado, previsoes$previsto,mode = "prec_recall")
+
+# Almost the same result as STB.
+
+# Optimize the best model - Stochastic Gradient Boosting
+ctrl <- trainControl(method = "cv", number=5)
+grid <- expand.grid(interaction.depth = c(1, 10, 15),
+                    n.trees = c(50, 300, 500),
+                    shrinkage = c(.1, .3, .5),
+                    n.minobsinnode = c(1, 5, 7))
+modeloSGB <- train(variaveisModelo, data=trainSet, method='gbm', trControl=ctrl, tuneGrid=grid, verbose=FALSE)
+print(modeloSGB)
+
+# Best parameters
+modeloSGB$bestTune
+
+# Train the model with the best parameters
+modeloSGB <- train(variaveisModelo, data=trainSet, method='gbm', trControl=ctrl, tuneGrid=modeloSGB$bestTune, verbose=FALSE)
+print(modeloSGB)
+previsoes <- data.frame(observado = testSet$boughtLastOrder,
+                        previsto = predict(modeloSGB, newdata = testSet))
+confusionMatrix(previsoes$observado, previsoes$previsto,mode = "prec_recall")
+
+# Balanced test dataset
+
+previsoes <- data.frame(observado = testSetB$boughtLastOrder,
+                        previsto = predict(modeloSGB, newdata = testSetB))
+confusionMatrix(previsoes$observado, previsoes$previsto,mode = "prec_recall")
+
+# The final result is a little bit better than what we got before.
+# In order to improve the performance, some more indicators related to User/Product
+# may be created. Further, we could train the model full, with no cuts for computational
+# reasons. Colaborative filtering techniques may be used as well.
+
+stopCluster(cl)
+
+```
+
